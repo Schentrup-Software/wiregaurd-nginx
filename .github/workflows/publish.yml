@@ -11,7 +11,13 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Never publish an image that does not build and pass its tests. The first
+  # version of this repo shipped a Dockerfile that could not build at all.
+  test:
+    uses: ./.github/workflows/tests.yml
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -175,6 +175,38 @@ builds `linux/amd64` and `linux/arm64` on every push to `main` and on `v*` tags,
 publishing to `ghcr.io/<owner>/<repo>`. Make the package public in the repo's
 Packages settings if you want to pull it without authenticating.
 
+## Tests
+
+```bash
+./tests/run.sh              # everything
+./tests/run.sh unit         # config generation only, ~10s, no tunnel
+./tests/run.sh integration  # full rig
+./tests/run.sh --keep       # leave it running to poke at
+```
+
+The unit suite runs the real entrypoint with `wg-quick` stubbed out and a real
+`nginx -t`, so it covers config generation and proves what it generates parses.
+
+The integration suite stands up an actual tunnel: a WireGuard server container
+with dummy TCP, HTTP and UDP services behind it on a private Docker network.
+The gateway is deliberately **not** attached to that network, so the tunnel is
+the only path — if it is down or the forwards are wrong, the tests fail rather
+than quietly succeeding over a Docker bridge, and one test asserts exactly that
+by checking the tester cannot reach the services directly.
+
+```
+tester ──client── gateway ──transit── wg-server ──home── svc-{tcp,http,udp}
+                     └────────── wg0 ──────────────┘
+```
+
+It also covers the things that are easy to get wrong and hard to notice: that
+the tunnel counters actually moved, that the far side of the tunnel cannot dial
+back in through a forward, and that a container on another network has no route
+at all. Both suites run in CI, and the image is not published unless they pass.
+
+Requires a host that can create WireGuard interfaces in a container — any recent
+Linux kernel, Docker Desktop, or a GitHub runner.
+
 ## License
 
 MIT

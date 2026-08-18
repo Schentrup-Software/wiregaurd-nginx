@@ -1,0 +1,6 @@
+# The image needs three files. Everything else — .git, the test rig, docs —
+# only slows the build context down.
+*
+!nginx.conf
+!entrypoint.sh
+!healthcheck.sh

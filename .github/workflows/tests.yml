@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:      # publish.yml gates the image build on this
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The integration rig builds real WireGuard interfaces. GitHub's runners
+      # carry the module; fail loudly here rather than deep inside the suite.
+      - name: Check the runner can do WireGuard
+        run: |
+          sudo modprobe wireguard
+          lsmod | grep -q wireguard && echo "wireguard module present"
+
+      - name: Run unit and integration tests
+        run: ./tests/run.sh

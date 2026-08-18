@@ -1,0 +1,139 @@
+# End-to-end rig. The point of the layout is that `gateway` is attached to
+# `transit` and `client` but NOT to `home` — so the only path from the tester to
+# the dummy services is through the WireGuard tunnel. If the tunnel is down or
+# the forwards are wrong, every service test fails rather than silently passing
+# over a Docker bridge.
+#
+#   tester ──client── gateway ──transit── wg-server ──home── svc-{tcp,http,udp}
+#                        └── wg0 ─────────────┘
+#
+# Keys are fixtures generated for these tests only. They protect nothing.
+
+name: wg-stream-gateway-tests
+
+x-keys: &keys
+  SERVER_PUBLIC_KEY: "oLnZj3sH8QthL2iVqwXHJ/n6sxrOnfS6dE/rQuBYRQ4="
+  CLIENT_PUBLIC_KEY: "HmLZfNlw/2jb5bFBtDS7dYplOv/DI+SoBV3diQp+iDk="
+  PRESHARED_KEY: "HSWsEx7XFd1xt+8ZweXhd0C69PV+hiiVQxxV7IuWvQc="
+
+services:
+  wg-server:
+    build: ./wg-server
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      <<: *keys
+      SERVER_PRIVATE_KEY: "oDMsF6kkq8JNLzmCFVrCwK/CEG/XfSZqBc54TZKrJ0Y="
+      HOME_SUBNET: "172.31.0.0/24"
+      TUNNEL_SUBNET: "10.13.13.0/24"
+    networks:
+      transit:
+        ipv4_address: 172.30.0.10
+      home:
+        ipv4_address: 172.31.0.10
+
+  # --- the "private network" the gateway is supposed to reach -----------------
+
+  svc-tcp:
+    image: alpine/socat:1.8.0.0
+    command: ["-T5", "TCP-LISTEN:5432,fork,reuseaddr", "SYSTEM:echo HOME-TCP-OK"]
+    networks:
+      home:
+        ipv4_address: 172.31.0.20
+
+  svc-http:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./services/index.html:/usr/share/nginx/html/index.html:ro
+    networks:
+      home:
+        ipv4_address: 172.31.0.21
+
+  svc-udp:
+    image: alpine/socat:1.8.0.0
+    command: ["-T5", "UDP-RECVFROM:5353,fork", "SYSTEM:echo HOME-UDP-OK"]
+    networks:
+      home:
+        ipv4_address: 172.31.0.22
+
+  # --- the image under test ---------------------------------------------------
+
+  gateway:
+    image: wg-stream-gateway:test
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    cap_add: [NET_ADMIN]
+    depends_on: [wg-server]
+    environment:
+      WG_PRIVATE_KEY: "sNUzsCOfYmRErEyAnMNW6n4W1z+g7kT6BT2izLHjTkw="
+      WG_PEER_PUBLIC_KEY: "oLnZj3sH8QthL2iVqwXHJ/n6sxrOnfS6dE/rQuBYRQ4="
+      WG_PRESHARED_KEY: "HSWsEx7XFd1xt+8ZweXhd0C69PV+hiiVQxxV7IuWvQc="
+      WG_ADDRESS: "10.13.13.2/32"
+      # Fixed transit address, not a name: wg-server has an address on `home`
+      # too, and Docker's resolver may hand back the one the gateway cannot
+      # reach.
+      WG_ENDPOINT: "172.30.0.10:51820"
+      WG_ALLOWED_IPS: "10.13.13.0/24, 172.31.0.0/24"
+      WG_HANDSHAKE_MAX_AGE: "120"
+      FORWARD_1: "5432:172.31.0.20:5432"
+      FORWARD_2: "9000:172.31.0.21:80"
+      UDP_FORWARD_1: "5353:172.31.0.22:5353"
+      # Deliberately unresolvable. A literal `proxy_pass name:port` would stop
+      # nginx from starting at all; the variable form must let the container
+      # come up with the other forwards working.
+      FORWARD_3: "9002:nonexistent.invalid:80"
+      # ALLOW_FROM left unset so DENY_FROM_TUNNEL's default applies and the
+      # tunnel-callback test below is meaningful.
+    networks:
+      transit:
+        ipv4_address: 172.30.0.20
+      client:
+        ipv4_address: 172.32.0.20
+
+  # --- test runners -----------------------------------------------------------
+
+  tester:
+    build: ./suite
+    depends_on:
+      gateway:
+        condition: service_healthy
+    volumes:
+      - ./suite:/suite:ro
+    networks: [client]
+
+  control:
+    build: ./control
+    volumes:
+      - ./control:/control:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      COMPOSE_PROJECT_NAME: wg-stream-gateway-tests
+    networks: [isolated]
+
+  # Config generation only — no tunnel, no compose dependencies.
+  unit:
+    build:
+      context: ./unit
+      args:
+        GATEWAY_IMAGE: wg-stream-gateway:test
+    volumes:
+      - ./unit:/unit:ro
+    networks: [isolated]
+
+  # Never attached to `client`; proves network membership is the access control.
+  outsider:
+    image: alpine:3.21
+    command: ["sleep", "infinity"]
+    networks: [isolated]
+
+networks:
+  transit:
+    ipam: {config: [{subnet: 172.30.0.0/24}]}
+  home:
+    ipam: {config: [{subnet: 172.31.0.0/24}]}
+  client:
+    ipam: {config: [{subnet: 172.32.0.0/24}]}
+  isolated:
+    ipam: {config: [{subnet: 172.33.0.0/24}]}
