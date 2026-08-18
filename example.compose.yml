@@ -1,0 +1,50 @@
+# Reference only — the point of this image is that Yacht can create it as a
+# single container. This file shows the equivalent settings.
+
+services:
+  wg-gateway:
+    image: ghcr.io/YOURNAME/wg-stream-gateway:latest
+    container_name: wg-gateway
+    cap_add:
+      - NET_ADMIN
+    # Only needed if the host kernel has no WireGuard module:
+    # devices:
+    #   - /dev/net/tun
+    environment:
+      WG_PRIVATE_KEY: "REPLACE"
+      WG_ADDRESS: "10.13.13.2/32"
+      WG_PEER_PUBLIC_KEY: "REPLACE"
+      WG_ENDPOINT: "home.example.com:51820"
+      WG_ALLOWED_IPS: "10.13.13.0/24, 192.168.1.0/24"
+      FORWARD_1: "5432:192.168.1.20:5432"
+      FORWARD_2: "9000:192.168.1.20:9000"
+      ALLOW_FROM: "172.16.0.0/12"
+      PROXY_TIMEOUT: "1h"
+    networks:
+      - vpn-access
+    restart: unless-stopped
+
+  # An app allowed to reach home: on vpn-access *and* the public proxy network.
+  app-a:
+    image: example/app
+    environment:
+      DB_HOST: wg-gateway
+      DB_PORT: "5432"
+      S3_ENDPOINT: http://wg-gateway:9000
+    networks:
+      - vpn-access
+      - proxy-net
+    restart: unless-stopped
+
+  # An app that must not reach home: proxy-net only. No route exists.
+  app-b:
+    image: example/other
+    networks:
+      - proxy-net
+    restart: unless-stopped
+
+networks:
+  vpn-access:
+    external: true
+  proxy-net:
+    external: true
