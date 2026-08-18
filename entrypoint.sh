@@ -49,14 +49,44 @@ fi
 chmod 600 "$RUN_CONF"
 
 # `DNS =` makes wg-quick rewrite /etc/resolv.conf, destroying Docker's embedded
-# resolver at 127.0.0.11. nginx resolves upstream names at config load, so the
-# symptom is nginx refusing to start rather than a per-upstream failure.
+# resolver at 127.0.0.11. nginx needs that resolver to look up upstream names,
+# so the symptom is nginx refusing to start rather than a per-upstream failure.
 if grep -qiE '^[[:space:]]*DNS[[:space:]]*=' "$RUN_CONF"; then
     log "stripping 'DNS =' — it would clobber Docker's resolver at 127.0.0.11"
     sed -i -E '/^[[:space:]]*DNS[[:space:]]*=/d' "$RUN_CONF"
 fi
 
+# WireGuard only rehandshakes when it has traffic to send. Without
+# PersistentKeepalive an idle tunnel's last handshake ages past
+# WG_HANDSHAKE_MAX_AGE, which makes the healthcheck report unhealthy and makes
+# the watchdog below tear down a perfectly good interface every 60 seconds.
+# Configs generated above already carry it; mounted ones frequently do not.
+_ka="${WG_KEEPALIVE:-25}"
+if [[ "$_ka" != "0" && "$_ka" != "off" ]]; then
+    _tmp="$(mktemp "/run/wg/${WG_IF}.XXXXXX")"
+    awk -v ka="$_ka" '
+        /^[[:space:]]*\[/ {
+            if (in_peer && !has_ka) print "PersistentKeepalive = " ka
+            in_peer = (tolower($0) ~ /^[[:space:]]*\[peer\]/)
+            has_ka = 0
+            print
+            next
+        }
+        in_peer && tolower($0) ~ /^[[:space:]]*persistentkeepalive[[:space:]]*=/ { has_ka = 1 }
+        { print }
+        END { if (in_peer && !has_ka) print "PersistentKeepalive = " ka }
+    ' "$RUN_CONF" > "$_tmp"
+    if ! cmp -s "$RUN_CONF" "$_tmp"; then
+        log "adding 'PersistentKeepalive = ${_ka}' — without it an idle tunnel's"
+        log "         handshake goes stale and the watchdog restarts it for nothing"
+    fi
+    cat "$_tmp" > "$RUN_CONF"
+    rm -f "$_tmp"
+fi
+
+_default_route=0
 if grep -qE '^[[:space:]]*AllowedIPs.*(0\.0\.0\.0/0|::/0)' "$RUN_CONF"; then
+    _default_route=1
     log "WARNING: AllowedIPs contains a default route."
     log "         wg-quick will install policy routing that sends replies to"
     log "         externally-originated connections down the tunnel, so any"
@@ -71,6 +101,10 @@ fi
 #    FORWARDS=a,b,c  — same syntax, comma separated, TCP
 ###############################################################################
 
+# Listeners bind 0.0.0.0, which includes wg0. Without an access rule the far
+# side of the tunnel can dial back in and be proxied straight into the private
+# network. An explicit ALLOW_FROM wins; otherwise deny exactly the ranges the
+# tunnel routes and leave the Docker networks open.
 ALLOW_BLOCK=""
 if [[ -n "${ALLOW_FROM:-}" ]]; then
     IFS=',' read -ra _cidrs <<< "$ALLOW_FROM"
@@ -79,7 +113,27 @@ if [[ -n "${ALLOW_FROM:-}" ]]; then
         [[ -n "$_c" ]] && ALLOW_BLOCK+="    allow ${_c};"$'\n'
     done
     ALLOW_BLOCK+="    deny all;"$'\n'
+elif [[ "${DENY_FROM_TUNNEL:-true}" == "true" ]]; then
+    if [[ "$_default_route" -eq 1 ]]; then
+        log "WARNING: not auto-denying tunnel sources — AllowedIPs is a default"
+        log "         route, so the deny list would match everything. Set ALLOW_FROM."
+    else
+        _denied=""
+        while IFS= read -r _c; do
+            [[ -n "$_c" ]] || continue
+            ALLOW_BLOCK+="    deny ${_c};"$'\n'
+            _denied+=" ${_c}"
+        done < <(grep -iE '^[[:space:]]*AllowedIPs[[:space:]]*=' "$RUN_CONF" \
+                 | cut -d= -f2- | tr ',' '\n' | tr -d ' \t\r' | grep -v '^$' | sort -u)
+        if [[ -n "$ALLOW_BLOCK" ]]; then
+            ALLOW_BLOCK+="    allow all;"$'\n'
+            log "denying new connections from tunnel-routed ranges:${_denied}"
+            log "         (DENY_FROM_TUNNEL=false to disable, or set ALLOW_FROM to be explicit)"
+        fi
+    fi
 fi
+
+srv_id=0
 
 emit() {
     local proto="$1" spec="$2"
@@ -94,7 +148,12 @@ emit() {
     [[ "$listen" =~ ^[0-9]+$ ]] || die "bad listen port in '${spec}'"
     [[ "$uport"  =~ ^[0-9]+$ ]] || die "bad upstream port in '${spec}'"
     [[ -n "$uhost" ]]           || die "missing upstream host in '${spec}'"
+    # Also decides literal-vs-name below, and keeps the value from carrying
+    # nginx syntax into the generated file.
+    [[ "$uhost" =~ ^[A-Za-z0-9._-]+$ || "$uhost" =~ ^\[[0-9A-Fa-f:]+\]$ ]] \
+        || die "bad upstream host '${uhost}' in '${spec}' — use a name, IPv4, or bracketed [IPv6]"
 
+    srv_id=$((srv_id + 1))
     log "forward ${proto^^} :${listen} -> ${uhost}:${uport}"
 
     {
@@ -105,10 +164,28 @@ emit() {
             echo "    listen ${listen};"
         fi
         printf '%s' "$ALLOW_BLOCK"
-        echo "    proxy_pass ${uhost}:${uport};"
+        if [[ "$uhost" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$uhost" =~ ^\[ ]]; then
+            # Literal address: resolved at config load and checked by nginx -t.
+            echo "    proxy_pass ${uhost}:${uport};"
+        else
+            # Name: routed through a variable so nginx re-resolves it on the
+            # resolver's valid= interval. A literal proxy_pass with a name is
+            # resolved once at config load and then pinned for the life of the
+            # container, stranding the forward if the upstream address moves.
+            echo "    set \$upstream_${srv_id} ${uhost}:${uport};"
+            echo "    proxy_pass \$upstream_${srv_id};"
+        fi
         echo "    proxy_connect_timeout ${PROXY_CONNECT_TIMEOUT:-10s};"
-        echo "    proxy_timeout ${PROXY_TIMEOUT:-1h};"
-        if [[ "$proto" != "udp" ]]; then
+        if [[ "$proto" == "udp" ]]; then
+            # A datagram has no close, so proxy_timeout is how long each UDP
+            # session stays pinned. The TCP default of 1h would exhaust
+            # worker_connections after a few thousand DNS queries.
+            echo "    proxy_timeout ${UDP_PROXY_TIMEOUT:-30s};"
+            if [[ -n "${UDP_PROXY_RESPONSES:-}" ]]; then
+                echo "    proxy_responses ${UDP_PROXY_RESPONSES};"
+            fi
+        else
+            echo "    proxy_timeout ${PROXY_TIMEOUT:-1h};"
             echo "    proxy_socket_keepalive on;"
         fi
         echo "}"
@@ -135,8 +212,19 @@ if [[ -n "${FORWARDS:-}" ]]; then
     done
 fi
 
-if [[ "$found" -eq 0 ]] && ! compgen -G "${STREAM_DIR}/*.conf" > /dev/null; then
-    die "no forwards defined — set FORWARD_1=LISTEN:HOST:PORT or mount ${STREAM_DIR}/*.conf"
+if [[ "$found" -eq 0 ]]; then
+    # $GEN has already been created, so it has to be excluded from this probe —
+    # a plain glob over the directory always matches it, which would make this
+    # check dead and let a typo'd FORWARD_1 start a gateway listening on nothing.
+    mounted=0
+    for _f in "${STREAM_DIR}"/*.conf; do
+        [[ -e "$_f" && "$_f" != "$GEN" ]] || continue
+        mounted=1
+        break
+    done
+    [[ "$mounted" -eq 1 ]] || die "no forwards defined — set FORWARD_1=LISTEN:HOST:PORT or mount ${STREAM_DIR}/*.conf"
+    log "no FORWARD_* variables set — using mounted ${STREAM_DIR}/*.conf only"
+    rm -f "$GEN"
 fi
 
 ###############################################################################

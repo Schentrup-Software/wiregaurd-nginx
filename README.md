@@ -77,15 +77,20 @@ removing it. Both are ordinary container edits.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ALLOW_FROM` | unset | Comma-separated CIDRs. Emits `allow`/`deny all` on every listener. Set to your Docker subnet to stop the tunnel's far side dialling back in. |
-| `PROXY_TIMEOUT` | `1h` | Idle timeout. nginx's own default is 10 minutes, which silently kills pooled database connections. |
+| `ALLOW_FROM` | unset | Comma-separated CIDRs. Emits `allow`/`deny all` on every generated listener. Takes precedence over `DENY_FROM_TUNNEL`. |
+| `DENY_FROM_TUNNEL` | `true` | When `ALLOW_FROM` is unset, deny new connections coming *from* the ranges in `AllowedIPs`. Listeners bind `0.0.0.0`, which includes `wg0`, so without this the far side of the tunnel can dial back in and be proxied into the private network. Skipped with a warning if `AllowedIPs` is a default route, since the deny list would then match everything. |
+| `PROXY_TIMEOUT` | `1h` | Idle timeout for TCP listeners. nginx's own default is 10 minutes, which silently kills pooled database connections. |
 | `PROXY_CONNECT_TIMEOUT` | `10s` | |
+| `UDP_PROXY_TIMEOUT` | `30s` | Idle timeout for UDP listeners, kept separate from `PROXY_TIMEOUT`. A datagram has no close, so this is how long each UDP session is pinned; at the TCP default of `1h` a few thousand DNS queries would exhaust `worker_connections`. |
+| `UDP_PROXY_RESPONSES` | unset | Datagrams expected back per datagram sent. Set to `1` for strict request/response protocols like DNS to free the session as soon as the reply arrives. Unset means unlimited, ended by `UDP_PROXY_TIMEOUT`. |
 | `WG_INTERFACE` | `wg0` | |
 | `WG_WATCHDOG` | `true` | Re-up the interface when handshakes go stale. WireGuard does not re-resolve a DNS endpoint on its own, so a home connection on a dynamic IP otherwise stays dead after a WAN change. |
 | `WG_HANDSHAKE_MAX_AGE` | `300` | Seconds. Also drives the Docker healthcheck. |
 
 For anything the variables don't cover, mount extra files into
-`/etc/nginx/stream.d/` — they're included alongside the generated ones.
+`/etc/nginx/stream.d/` — they're included alongside the generated ones. Note
+that `ALLOW_FROM` and `DENY_FROM_TUNNEL` only apply to listeners this image
+generates; write the `allow`/`deny` rules yourself in files you mount.
 
 ---
 
@@ -102,13 +107,29 @@ container traffic keeps working, which makes it confusing to diagnose. The
 entrypoint warns if it sees one.
 
 **No `DNS =` line.** `wg-quick` honours it by rewriting `/etc/resolv.conf`,
-which destroys Docker's embedded resolver — and since nginx resolves upstream
-names at config load, nginx then refuses to start entirely. The entrypoint
-strips the line and logs that it did.
+which destroys Docker's embedded resolver, which is what nginx uses to look up
+upstream names. The entrypoint strips the line and logs that it did.
+
+**Upstream names are re-resolved at runtime.** A forward whose upstream is a
+hostname is emitted through an nginx variable, so the address is re-checked on
+the resolver's `valid=` interval (10s) instead of being pinned at config load
+for the life of the container. Forwards to a literal address are emitted
+directly and still validated by `nginx -t` at startup. Note the resolver is
+*Docker's*, not the tunnel's — a name only the remote network's DNS can answer
+will not resolve, so use an address for those.
+
+**`PersistentKeepalive` is added if missing.** WireGuard only rehandshakes when
+it has traffic to send, so an idle tunnel without it goes longer than
+`WG_HANDSHAKE_MAX_AGE` between handshakes — which reads as failure to both the
+healthcheck and the watchdog, and gets a perfectly good interface restarted
+every 60 seconds. Mounted configs frequently omit it, so the entrypoint adds it
+to any `[Peer]` that has none. Set `WG_KEEPALIVE=0` to opt out.
 
 **Kernel module.** Uses the host's WireGuard module when present. If it's
 missing, `wg-quick` falls back to the bundled `wireguard-go`, which needs
-`/dev/net/tun` mapped into the container and is noticeably slower.
+`/dev/net/tun` mapped into the container and is noticeably slower. Alpine no
+longer packages `wireguard-go`, so the Dockerfile cross-compiles it from a
+pinned upstream commit in a builder stage.
 
 **Client IPs are not preserved.** Upstream services see the gateway's tunnel
 address. Fine for databases and object stores; don't put anything
@@ -127,6 +148,12 @@ The gateway holds tunnel credentials and can reach whatever `WG_ALLOWED_IPS`
 permits. There is no admin UI and no runtime configuration surface — changing
 what it forwards requires changing environment variables and recreating the
 container, which is a meaningfully higher bar than a leaked web password.
+
+Listeners bind all interfaces, `wg0` included, so the far side of the tunnel
+can reach the forwards too. By default the entrypoint denies new connections
+originating from the ranges in `AllowedIPs`, which closes that path without
+having to guess your Docker subnets; `ALLOW_FROM` replaces that with an explicit
+allowlist, and `DENY_FROM_TUNNEL=false` turns it off.
 
 What it does **not** protect against: an attacker with write access to your
 Docker host or container definitions. If `WG_ALLOWED_IPS` covers the whole home
