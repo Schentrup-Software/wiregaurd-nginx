@@ -1,4 +1,4 @@
-# wg-stream-gateway
+# wiregaurd-nginx
 
 An nginx TCP/UDP stream proxy with a WireGuard client built in. One container:
 apps on a Docker network connect to it by name, and it forwards them over the
