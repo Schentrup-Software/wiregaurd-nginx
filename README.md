@@ -1,5 +1,8 @@
 # wiregaurd-nginx
 
+[![tests](https://github.com/Schentrup-Software/wiregaurd-nginx/actions/workflows/tests.yml/badge.svg)](https://github.com/Schentrup-Software/wiregaurd-nginx/actions/workflows/tests.yml)
+[![publish](https://github.com/Schentrup-Software/wiregaurd-nginx/actions/workflows/publish.yml/badge.svg)](https://github.com/Schentrup-Software/wiregaurd-nginx/actions/workflows/publish.yml)
+
 An nginx TCP/UDP stream proxy with a WireGuard client built in. One container:
 apps on a Docker network connect to it by name, and it forwards them over the
 tunnel to a private network.
@@ -21,7 +24,7 @@ the access control — there are no firewall rules to maintain.
 
 ## Quick start in Yacht
 
-**Image:** `ghcr.io/<you>/wg-stream-gateway:latest`
+**Image:** `ghcr.io/schentrup-software/wiregaurd-nginx:latest`
 
 **Capabilities:** add `NET_ADMIN`.
 
@@ -170,10 +173,12 @@ configuration this container can rewrite.
 docker build -t wg-stream-gateway .
 ```
 
-Push to GHCR by putting this repo on GitHub — `.github/workflows/publish.yml`
-builds `linux/amd64` and `linux/arm64` on every push to `main` and on `v*` tags,
-publishing to `ghcr.io/<owner>/<repo>`. Make the package public in the repo's
-Packages settings if you want to pull it without authenticating.
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) builds
+`linux/amd64` and `linux/arm64` on every push to `master` and on `v*` tags,
+publishing to [`ghcr.io/schentrup-software/wiregaurd-nginx`](https://github.com/Schentrup-Software/wiregaurd-nginx/pkgs/container/wiregaurd-nginx).
+The image is only built if [`tests.yml`](.github/workflows/tests.yml) passes
+first. Make the package public in the repo's Packages settings if you want to
+pull it without authenticating.
 
 ## Tests
 

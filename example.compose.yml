@@ -3,7 +3,7 @@
 
 services:
   wg-gateway:
-    image: ghcr.io/YOURNAME/wg-stream-gateway:latest
+    image: ghcr.io/schentrup-software/wiregaurd-nginx:latest
     container_name: wg-gateway
     cap_add:
       - NET_ADMIN

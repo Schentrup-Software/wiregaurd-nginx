@@ -19,4 +19,5 @@ jobs:
           lsmod | grep -q wireguard && echo "wireguard module present"
 
       - name: Run unit and integration tests
-        run: ./tests/run.sh
+        # Invoked via bash so a checkout that lost the exec bit still works.
+        run: bash ./tests/run.sh
